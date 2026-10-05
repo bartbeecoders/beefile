@@ -9,3 +9,6 @@ Add a build nr to athe app, so we can always see what version it is.
 
 
 add the ability to link file extensions to apps that can open it
+
+Create a branch for:
+ability to have color themes, one of the themes should be the omarchy selected theme
