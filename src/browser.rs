@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    actions, anchored, div, prelude::*, px, rgb, uniform_list, App, Context, FocusHandle,
+    actions, anchored, div, prelude::*, px, rgb, rgba, uniform_list, App, Context, FocusHandle,
     KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, ScrollStrategy,
     UniformListScrollHandle, Window,
 };
@@ -15,6 +15,7 @@ use crate::format::{self, Crumb};
 use crate::fsops::{self, Place};
 use crate::model::{self, Kind, Listing, SortKey};
 use crate::openers;
+use crate::theme::{self, Palette};
 
 actions!(
     beefile,
@@ -34,6 +35,7 @@ actions!(
         ToggleHidden,
         CycleSort,
         ToggleSortDir,
+        CycleTheme,
         Refresh,
         Yank,
         Cut,
@@ -83,25 +85,12 @@ const HELP: &[(&str, &str)] = &[
     ("Ctrl-L", "Go to path"),
     (".", "Show hidden files"),
     ("s    S", "Cycle sort / reverse"),
+    ("t", "Cycle color theme"),
     ("Ctrl-R  F5", "Refresh"),
     ("?", "Help"),
     ("Esc", "Cancel, then clear filter"),
     ("q    Ctrl-Q", "Quit"),
 ];
-
-const BG: u32 = 0x161410;
-const PANEL: u32 = 0x201e1a;
-const ELEVATED: u32 = 0x2a2722;
-const LINE: u32 = 0x3a342c;
-const TEXT: u32 = 0xf4efe6;
-const MUTED: u32 = 0xa39886;
-const DIM: u32 = 0x6f675c;
-const HONEY: u32 = 0xe2b657;
-const SELECT: u32 = 0x3c3424;
-const DROP: u32 = 0x4a3c22;
-const BLUE: u32 = 0x8fb7d6;
-const DANGER: u32 = 0xe07a5f;
-const OK: u32 = 0x9cba7a;
 
 const ROW_H: f32 = 30.0;
 
@@ -133,6 +122,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(".", ToggleHidden, Some("BeeFile")),
         KeyBinding::new("s", CycleSort, Some("BeeFile")),
         KeyBinding::new("shift-s", ToggleSortDir, Some("BeeFile")),
+        KeyBinding::new("t", CycleTheme, Some("BeeFile")),
         KeyBinding::new("ctrl-r", Refresh, Some("BeeFile")),
         KeyBinding::new("f5", Refresh, Some("BeeFile")),
         KeyBinding::new("y", Yank, Some("BeeFile")),
@@ -271,6 +261,15 @@ pub struct Browser {
     favorites_file: PathBuf,
     openers: BTreeMap<String, String>,
     openers_file: PathBuf,
+    theme_id: theme::ThemeId,
+    palette: Palette,
+    theme_label: String,
+    theme_file: PathBuf,
+    /// Set after an Omarchy palette has been read. Theme switches delete
+    /// `colors.toml` for a moment; the last good colors stay up through that.
+    omarchy_live: bool,
+    theme_watch_tx: async_channel::Sender<()>,
+    theme_watcher: Option<notify::RecommendedWatcher>,
     menu: Option<ContextMenu>,
     marks: BTreeSet<PathBuf>,
     clipboard: Option<Clip>,
@@ -299,6 +298,10 @@ impl Browser {
         cx: &mut Context<Self>,
     ) -> Self {
         let (tx, rx) = async_channel::bounded(64);
+        let (theme_tx, theme_rx) = async_channel::bounded(8);
+        let theme_file = theme::theme_file();
+        let theme_id = theme::initial_choice(&theme_file);
+        let resolved = theme::resolve(theme_id);
         let focus = cx.focus_handle();
         let prompt_focus = cx.focus_handle();
         focus.focus(window);
@@ -316,6 +319,13 @@ impl Browser {
             favorites_file: fsops::favorites_file(),
             openers: BTreeMap::new(),
             openers_file: openers::openers_file(),
+            theme_id,
+            palette: resolved.palette,
+            theme_label: resolved.label,
+            theme_file,
+            omarchy_live: theme_id == theme::ThemeId::Omarchy && resolved.available,
+            theme_watch_tx: theme_tx,
+            theme_watcher: None,
             menu: None,
             marks: BTreeSet::new(),
             clipboard: None,
@@ -338,7 +348,9 @@ impl Browser {
         this.favorites = fsops::read_favorites(&this.favorites_file);
         this.openers = openers::read_openers(&this.openers_file);
         this.spawn_poll(rx, cx);
+        this.spawn_theme_poll(theme_rx, cx);
         this.arm_watcher();
+        this.arm_theme_watcher();
         this.set_title(window);
         this.reload(cx, false);
         this
@@ -401,6 +413,108 @@ impl Browser {
             return;
         }
         self.watcher = Some(watcher);
+    }
+
+    fn spawn_theme_poll(&mut self, rx: async_channel::Receiver<()>, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            if rx.recv().await.is_err() {
+                break;
+            }
+            let executor = cx.background_executor().clone();
+            executor
+                .spawn(async { std::thread::sleep(Duration::from_millis(200)) })
+                .await;
+            while rx.try_recv().is_ok() {}
+            let alive = this.update(cx, |this, cx| this.refresh_theme(cx, true));
+            let Ok(retry) = alive else {
+                break;
+            };
+            if !retry {
+                continue;
+            }
+            let executor = cx.background_executor().clone();
+            executor
+                .spawn(async { std::thread::sleep(Duration::from_millis(200)) })
+                .await;
+            while rx.try_recv().is_ok() {}
+            if this
+                .update(cx, |this, cx| {
+                    // The directory swap is over. Apply whatever is on disk now,
+                    // including the Honey fallback when the palette is still gone.
+                    this.omarchy_live = false;
+                    this.refresh_theme(cx, true);
+                })
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    fn arm_theme_watcher(&mut self) {
+        self.theme_watcher = None;
+        if self.theme_id != theme::ThemeId::Omarchy {
+            return;
+        }
+        let dir = theme::omarchy_current_dir();
+        if !dir.is_dir() {
+            return;
+        }
+        let tx = self.theme_watch_tx.clone();
+        let mut watcher =
+            match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+                if res.is_ok() {
+                    let _ = tx.try_send(());
+                }
+            }) {
+                Ok(watcher) => watcher,
+                Err(_) => return,
+            };
+        if watcher
+            .watch(&dir, notify::RecursiveMode::NonRecursive)
+            .is_err()
+        {
+            return;
+        }
+        self.theme_watcher = Some(watcher);
+    }
+
+    /// Returns true when the Omarchy palette was missing and should be read again.
+    fn refresh_theme(&mut self, cx: &mut Context<Self>, announce: bool) -> bool {
+        let resolved = theme::resolve(self.theme_id);
+        if self.theme_id == theme::ThemeId::Omarchy && !resolved.available && self.omarchy_live {
+            return true;
+        }
+        let label_changed = self.theme_label != resolved.label;
+        let changed = self.palette != resolved.palette || label_changed;
+        self.omarchy_live = self.theme_id == theme::ThemeId::Omarchy && resolved.available;
+        self.palette = resolved.palette;
+        self.theme_label = resolved.label;
+        if announce && label_changed {
+            self.note = Some(format!("Theme: {}", self.theme_label));
+        }
+        if changed {
+            cx.notify();
+        }
+        false
+    }
+
+    fn cycle_theme(&mut self, _: &CycleTheme, _: &mut Window, cx: &mut Context<Self>) {
+        if self.typing() {
+            return;
+        }
+        self.theme_id = self.theme_id.next();
+        self.refresh_theme(cx, true);
+        self.arm_theme_watcher();
+        match theme::write_choice(&self.theme_file, self.theme_id) {
+            Ok(()) => self.error = None,
+            Err(err) => {
+                self.error = Some(err);
+                self.note = None;
+            }
+        }
+        cx.notify();
     }
 
     fn reload(&mut self, cx: &mut Context<Self>, preserve: bool) {
@@ -1553,8 +1667,8 @@ impl Render for Browser {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(BG))
-            .text_color(rgb(TEXT))
+            .bg(rgb(self.palette.bg))
+            .text_color(rgb(self.palette.text))
             .text_size(px(14.))
             .on_modifiers_changed(cx.listener(
                 |_this, _: &gpui::ModifiersChangedEvent, window, cx| {
@@ -1578,6 +1692,7 @@ impl Render for Browser {
             .on_action(cx.listener(Self::toggle_hidden))
             .on_action(cx.listener(Self::cycle_sort))
             .on_action(cx.listener(Self::toggle_sort_dir))
+            .on_action(cx.listener(Self::cycle_theme))
             .on_action(cx.listener(Self::refresh))
             .on_action(cx.listener(Self::yank))
             .on_action(cx.listener(Self::cut))
@@ -1617,6 +1732,7 @@ impl Render for Browser {
 
 impl Browser {
     fn render_path(&self, crumbs: Vec<Crumb>, cx: &mut Context<Self>) -> impl IntoElement {
+        let c = self.palette;
         let mut row = div()
             .flex()
             .items_center()
@@ -1624,13 +1740,13 @@ impl Browser {
             .gap(px(2.))
             .px(px(12.))
             .py(px(8.))
-            .bg(rgb(PANEL))
+            .bg(rgb(c.panel))
             .border_b_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(c.line))
             .min_h(px(40.));
         for (index, crumb) in crumbs.into_iter().enumerate() {
             if index > 0 {
-                row = row.child(div().text_color(rgb(DIM)).child("/"));
+                row = row.child(div().text_color(rgb(c.dim)).child("/"));
             }
             let path = crumb.path.clone();
             let current = path == self.cwd;
@@ -1644,8 +1760,8 @@ impl Browser {
                         .py(px(2.))
                         .rounded(px(4.))
                         .cursor_pointer()
-                        .text_color(rgb(if current { HONEY } else { TEXT }))
-                        .hover(|style| style.bg(rgb(ELEVATED)))
+                        .text_color(rgb(if current { c.accent } else { c.text }))
+                        .hover(|style| style.bg(rgb(c.elevated)))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
@@ -1661,6 +1777,7 @@ impl Browser {
                         ),
                     path,
                     true,
+                    c.drop,
                     cx,
                 )
                 .child(crumb.label),
@@ -1670,6 +1787,7 @@ impl Browser {
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let c = self.palette;
         let mut side = div()
             .id("sidebar")
             .w(px(196.))
@@ -1677,11 +1795,11 @@ impl Browser {
             .flex()
             .flex_col()
             .py(px(8.))
-            .bg(rgb(PANEL))
+            .bg(rgb(c.panel))
             .border_r_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(c.line))
             .overflow_y_scroll()
-            .child(section_label("Places"));
+            .child(section_label("Places", c.dim));
         for (index, place) in self.places.iter().enumerate() {
             side = side.child(self.place_row(
                 ("place", index),
@@ -1692,13 +1810,13 @@ impl Browser {
         }
         let favorites = self.favorite_entries();
         if !favorites.is_empty() {
-            side = side.child(section_label("Favorites"));
+            side = side.child(section_label("Favorites", c.dim));
             for (index, (label, path)) in favorites.into_iter().enumerate() {
                 side = side.child(self.place_row(("fav", index), label, path, cx));
             }
         }
         if !self.media.is_empty() {
-            side = side.child(section_label("Media"));
+            side = side.child(section_label("Media", c.dim));
             for (index, place) in self.media.iter().enumerate() {
                 side = side.child(self.place_row(
                     ("media", index),
@@ -1718,6 +1836,7 @@ impl Browser {
         path: PathBuf,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        let c = self.palette;
         let active = path == self.cwd;
         let click_path = path.clone();
         let menu_path = path.clone();
@@ -1732,9 +1851,9 @@ impl Browser {
                 .overflow_hidden()
                 .whitespace_nowrap()
                 .text_ellipsis()
-                .bg(rgb(if active { SELECT } else { PANEL }))
-                .text_color(rgb(if active { HONEY } else { TEXT }))
-                .hover(|style| style.bg(rgb(ELEVATED)))
+                .bg(rgb(if active { c.select } else { c.panel }))
+                .text_color(rgb(if active { c.accent } else { c.text }))
+                .hover(|style| style.bg(rgb(c.elevated)))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
@@ -1750,6 +1869,7 @@ impl Browser {
                 ),
             path,
             true,
+            c.drop,
             cx,
         )
         .child(label)
@@ -1773,6 +1893,7 @@ impl Browser {
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let c = self.palette;
         div()
             .w_full()
             .flex()
@@ -1781,9 +1902,9 @@ impl Browser {
             .px(px(8.))
             .gap(px(8.))
             .text_size(px(12.))
-            .text_color(rgb(MUTED))
+            .text_color(rgb(c.muted))
             .border_b_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(c.line))
             .child(div().w(px(18.)).flex_shrink_0())
             .child(div().w(px(14.)).flex_shrink_0())
             .child(self.header_cell("Name", SortKey::Name, true, cx))
@@ -1831,15 +1952,17 @@ impl Browser {
                 "Nothing matches"
             };
             let cwd = self.cwd.clone();
+            let c = self.palette;
             return attach_drop(
                 div()
                     .flex_1()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_color(rgb(MUTED)),
+                    .text_color(rgb(c.muted)),
                 cwd.clone(),
                 false,
+                c.drop,
                 cx,
             )
             .on_mouse_down(
@@ -1853,6 +1976,7 @@ impl Browser {
         let count = self.listing.len();
         let cwd = self.cwd.clone();
         let cwd_menu = cwd.clone();
+        let list_drop = self.palette.drop;
         div().flex_1().min_h(px(0.)).child(
             attach_drop(
                 uniform_list(
@@ -1872,17 +1996,17 @@ impl Browser {
                             let path = info.path.to_path_buf();
                             let marked = this.marks.contains(&path);
                             let selected = ix == this.listing.cursor;
+                            let c = this.palette;
                             let name_color = if is_parent {
-                                DIM
+                                c.dim
                             } else {
                                 match kind {
-                                    Kind::Dir => HONEY,
-                                    Kind::Symlink => BLUE,
-                                    Kind::File => TEXT,
-                                    Kind::Other => MUTED,
+                                    Kind::Dir => c.accent,
+                                    Kind::Symlink => c.link,
+                                    Kind::File => c.text,
+                                    Kind::Other => c.muted,
                                 }
                             };
-                            let mark_color = if marked { HONEY } else { 0x000000 };
                             let size_text = if is_parent || size.is_none() {
                                 "-".into()
                             } else {
@@ -1903,13 +2027,13 @@ impl Browser {
                                 .h(px(ROW_H))
                                 .px(px(8.))
                                 .gap(px(8.))
-                                .bg(rgb(if selected { SELECT } else { BG }))
+                                .bg(rgb(if selected { c.select } else { c.bg }))
                                 .cursor_pointer()
                                 .hover(|style| {
                                     if selected {
                                         style
                                     } else {
-                                        style.bg(rgb(ELEVATED))
+                                        style.bg(rgb(c.elevated))
                                     }
                                 })
                                 .on_mouse_down(
@@ -1936,13 +2060,17 @@ impl Browser {
                                 let dragged = FileDrag {
                                     paths: this.drag_paths_for(&path),
                                 };
-                                row = row.on_drag(dragged, |drag, _offset, _window, cx| {
+                                let ghost = c;
+                                row = row.on_drag(dragged, move |drag, _offset, _window, cx| {
                                     let label = drag_label(&drag.paths);
-                                    cx.new(move |_| DragGhost { label })
+                                    cx.new(move |_| DragGhost {
+                                        label,
+                                        colors: ghost,
+                                    })
                                 });
                             }
                             row = if drop_here {
-                                attach_drop(row, path.clone(), true, cx)
+                                attach_drop(row, path.clone(), true, c.drop, cx)
                             } else {
                                 swallow_drop(row, cx)
                             };
@@ -1953,7 +2081,7 @@ impl Browser {
                                         .flex_shrink_0()
                                         .flex()
                                         .justify_center()
-                                        .child(dot(mark_color, marked)),
+                                        .child(dot(c.accent, marked)),
                                 )
                                 .child(
                                     div()
@@ -1961,7 +2089,7 @@ impl Browser {
                                         .flex_shrink_0()
                                         .flex()
                                         .justify_center()
-                                        .child(kind_dot(kind, is_parent)),
+                                        .child(kind_dot(kind, is_parent, c)),
                                 )
                                 .child(
                                     div()
@@ -1979,14 +2107,14 @@ impl Browser {
                                         .flex_shrink_0()
                                         .flex()
                                         .justify_end()
-                                        .text_color(rgb(MUTED))
+                                        .text_color(rgb(c.muted))
                                         .child(size_text),
                                 )
                                 .child(
                                     div()
                                         .w(px(148.))
                                         .flex_shrink_0()
-                                        .text_color(rgb(MUTED))
+                                        .text_color(rgb(c.muted))
                                         .child(time_text),
                                 ),
                             );
@@ -1998,6 +2126,7 @@ impl Browser {
                 .size_full(),
                 cwd,
                 false,
+                list_drop,
                 cx,
             )
             .on_mouse_down(
@@ -2010,6 +2139,7 @@ impl Browser {
     }
 
     fn render_help(&self) -> gpui::Div {
+        let c = self.palette;
         let mut list = div()
             .flex_1()
             .flex()
@@ -2020,7 +2150,7 @@ impl Browser {
             .overflow_hidden()
             .child(
                 div()
-                    .text_color(rgb(HONEY))
+                    .text_color(rgb(c.accent))
                     .pb(px(6.))
                     .child(format!("BeeFile {}", crate::version::label())),
             );
@@ -2029,14 +2159,15 @@ impl Browser {
                 div()
                     .flex()
                     .gap(px(16.))
-                    .child(div().w(px(220.)).text_color(rgb(TEXT)).child(*keys))
-                    .child(div().text_color(rgb(MUTED)).child(*action)),
+                    .child(div().w(px(220.)).text_color(rgb(c.text)).child(*keys))
+                    .child(div().text_color(rgb(c.muted)).child(*action)),
             );
         }
         list
     }
 
     fn render_prompt(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let c = self.palette;
         if let Some(prompt) = &self.prompt {
             let message = prompt_message(prompt);
             let danger = matches!(prompt.kind, PromptKind::Delete { .. });
@@ -2049,12 +2180,12 @@ impl Browser {
                 .gap(px(10.))
                 .h(px(36.))
                 .px(px(12.))
-                .bg(rgb(ELEVATED))
+                .bg(rgb(c.elevated))
                 .border_t_1()
-                .border_color(rgb(if danger { DANGER } else { HONEY }))
+                .border_color(rgb(if danger { c.danger } else { c.accent }))
                 .child(
                     div()
-                        .text_color(rgb(if danger { DANGER } else { HONEY }))
+                        .text_color(rgb(if danger { c.danger } else { c.accent }))
                         .child(prompt.kind.label()),
                 )
                 .child(
@@ -2076,10 +2207,10 @@ impl Browser {
                 .h(px(28.))
                 .px(px(12.))
                 .text_size(px(12.))
-                .text_color(rgb(DIM))
-                .bg(rgb(PANEL))
+                .text_color(rgb(c.dim))
+                .bg(rgb(c.panel))
                 .border_t_1()
-                .border_color(rgb(LINE))
+                .border_color(rgb(c.line))
                 .cursor_pointer()
                 .on_mouse_down(
                     MouseButton::Left,
@@ -2153,6 +2284,8 @@ impl Browser {
         } else {
             String::new()
         };
+        let c = self.palette;
+        let theme_label = self.theme_label.clone();
 
         div()
             .flex()
@@ -2161,9 +2294,9 @@ impl Browser {
             .gap(px(12.))
             .h(px(28.))
             .px(px(12.))
-            .bg(rgb(PANEL))
+            .bg(rgb(c.panel))
             .border_t_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(c.line))
             .text_size(px(12.))
             .overflow_hidden()
             .child(
@@ -2172,7 +2305,11 @@ impl Browser {
                     .min_w(px(0.))
                     .overflow_hidden()
                     .whitespace_nowrap()
-                    .text_color(rgb(if self.error.is_some() { DANGER } else { TEXT }))
+                    .text_color(rgb(if self.error.is_some() {
+                        c.danger
+                    } else {
+                        c.text
+                    }))
                     .child(
                         self.error
                             .clone()
@@ -2189,22 +2326,28 @@ impl Browser {
                     .child(
                         div()
                             .text_color(rgb(if self.note.as_deref() == Some("Reading…") {
-                                HONEY
+                                c.accent
                             } else if self
                                 .clipboard
                                 .as_ref()
                                 .is_some_and(|clip| matches!(clip, Clip::Cut(_)))
                             {
-                                OK
+                                c.ok
                             } else {
-                                MUTED
+                                c.muted
                             }))
                             .whitespace_nowrap()
                             .child(parts.join("   ")),
                     )
                     .child(
                         div()
-                            .text_color(rgb(DIM))
+                            .text_color(rgb(c.dim))
+                            .whitespace_nowrap()
+                            .child(theme_label),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(c.dim))
                             .whitespace_nowrap()
                             .child(crate::version::label()),
                     ),
@@ -2222,6 +2365,7 @@ impl Browser {
             "Add to favorites".to_string()
         };
         let title = format::display_path(&path, &self.home);
+        let c = self.palette;
         let mut panel = div()
             .id("context-menu")
             .occlude()
@@ -2231,9 +2375,9 @@ impl Browser {
             }))
             .w(px(280.))
             .py(px(4.))
-            .bg(rgb(ELEVATED))
+            .bg(rgb(c.elevated))
             .border_1()
-            .border_color(rgb(LINE))
+            .border_color(rgb(c.line))
             .rounded(px(6.))
             .text_size(px(13.))
             .child(
@@ -2242,7 +2386,7 @@ impl Browser {
                     .pt(px(6.))
                     .pb(px(4.))
                     .text_size(px(12.))
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(c.muted))
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_ellipsis()
@@ -2257,12 +2401,14 @@ impl Browser {
                 .child(menu_action(
                     "context-menu-foot",
                     "Open foot here".to_string(),
+                    c.select,
                     cx,
                     move |this, _window, cx| this.open_here(fsops::HereApp::Foot, &foot_path, cx),
                 ))
                 .child(menu_action(
                     "context-menu-cursor",
                     "Open Cursor here".to_string(),
+                    c.select,
                     cx,
                     move |this, _window, cx| {
                         this.open_here(fsops::HereApp::Cursor, &cursor_path, cx);
@@ -2271,12 +2417,13 @@ impl Browser {
         }
         if is_dir || favorite {
             if is_dir || is_file {
-                panel = panel.child(menu_rule());
+                panel = panel.child(menu_rule(c.line));
             }
             let fav_path = path.clone();
             panel = panel.child(menu_action(
                 "context-menu-favorite",
                 favorite_label,
+                c.select,
                 cx,
                 move |this, _window, cx| this.toggle_favorite(&fav_path, cx),
             ));
@@ -2293,11 +2440,13 @@ impl Browser {
         menu: &ContextMenu,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        let colors = self.palette;
         let Some(ext) = menu.ext.clone() else {
             let open_path = menu.path.clone();
             return panel.child(menu_action(
                 "context-menu-open",
                 "Open".to_string(),
+                colors.select,
                 cx,
                 move |this, _window, cx| this.open_file(&open_path, cx),
             ));
@@ -2312,6 +2461,7 @@ impl Browser {
                 panel = panel.child(menu_action(
                     "context-menu-linked",
                     format!("{spec}  ·  linked"),
+                    colors.select,
                     cx,
                     move |this, _window, cx| {
                         this.use_opener(
@@ -2340,6 +2490,7 @@ impl Browser {
             panel = panel.child(menu_action(
                 ("opener", index),
                 label,
+                colors.select,
                 cx,
                 move |this, _window, cx| {
                     this.use_opener(
@@ -2353,7 +2504,7 @@ impl Browser {
                 },
             ));
         }
-        panel = panel.child(menu_rule());
+        panel = panel.child(menu_rule(colors.line));
         let prompt_path = menu.path.clone();
         let prompt_ext = ext.clone();
         let prefill = linked
@@ -2363,6 +2514,7 @@ impl Browser {
         panel = panel.child(menu_action(
             "context-menu-other",
             "Other command…".to_string(),
+            colors.select,
             cx,
             move |this, window, cx| {
                 this.prompt_opener(
@@ -2379,6 +2531,7 @@ impl Browser {
             panel = panel.child(menu_action(
                 "context-menu-clear",
                 "Clear link".to_string(),
+                colors.select,
                 cx,
                 move |this, _window, cx| this.unlink_extension(&clear_ext, cx),
             ));
@@ -2408,6 +2561,7 @@ fn app_label(app: &openers::AppChoice, apps: &[openers::AppChoice]) -> String {
 fn menu_action(
     id: impl Into<gpui::ElementId>,
     label: String,
+    select: u32,
     cx: &mut Context<Browser>,
     on_press: impl Fn(&mut Browser, &mut Window, &mut Context<Browser>) + 'static,
 ) -> impl IntoElement {
@@ -2418,7 +2572,7 @@ fn menu_action(
         .mx(px(4.))
         .rounded(px(4.))
         .cursor_pointer()
-        .hover(|style| style.bg(rgb(SELECT)))
+        .hover(move |style| style.bg(rgb(select)))
         .overflow_hidden()
         .whitespace_nowrap()
         .text_ellipsis()
@@ -2432,8 +2586,8 @@ fn menu_action(
         .child(label)
 }
 
-fn menu_rule() -> gpui::Div {
-    div().my(px(4.)).mx(px(8.)).h(px(1.)).bg(rgb(LINE))
+fn menu_rule(line: u32) -> gpui::Div {
+    div().my(px(4.)).mx(px(8.)).h(px(1.)).bg(rgb(line))
 }
 
 fn folder_label(path: &Path, home: &Path) -> String {
@@ -2454,21 +2608,23 @@ struct FileDrag {
 
 struct DragGhost {
     label: String,
+    colors: Palette,
 }
 
 impl Render for DragGhost {
     fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let copy = window.modifiers().control;
         let verb = if copy { "Copy" } else { "Move" };
+        let colors = self.colors;
         div()
             .px(px(10.))
             .py(px(6.))
-            .bg(rgb(ELEVATED))
+            .bg(rgb(colors.elevated))
             .border_1()
-            .border_color(rgb(if copy { BLUE } else { HONEY }))
+            .border_color(rgb(if copy { colors.link } else { colors.accent }))
             .rounded(px(4.))
             .text_size(px(13.))
-            .text_color(rgb(TEXT))
+            .text_color(rgb(colors.text))
             .child(format!("{verb} {}", self.label))
     }
 }
@@ -2483,11 +2639,18 @@ fn drag_label(paths: &[PathBuf]) -> String {
     }
 }
 
-fn attach_drop<E>(element: E, dest: PathBuf, highlight: bool, cx: &mut Context<Browser>) -> E
+fn attach_drop<E>(
+    element: E,
+    dest: PathBuf,
+    highlight: bool,
+    drop_color: u32,
+    cx: &mut Context<Browser>,
+) -> E
 where
     E: InteractiveElement,
 {
     let external_dest = dest.clone();
+    let external_color = drop_color;
     let mut element = element
         .on_drop(cx.listener(move |this, drag: &FileDrag, window, cx| {
             let copy = window.modifiers().control;
@@ -2500,8 +2663,8 @@ where
         );
     if highlight {
         element = element
-            .drag_over::<FileDrag>(|style, _, _, _| style.bg(rgb(DROP)))
-            .drag_over::<gpui::ExternalPaths>(|style, _, _, _| style.bg(rgb(DROP)));
+            .drag_over::<FileDrag>(move |style, _, _, _| style.bg(rgb(drop_color)))
+            .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| style.bg(rgb(external_color)));
     }
     element
 }
@@ -2521,13 +2684,13 @@ where
         ))
 }
 
-fn section_label(text: &'static str) -> gpui::Div {
+fn section_label(text: &'static str, dim: u32) -> gpui::Div {
     div()
         .px(px(16.))
         .pt(px(8.))
         .pb(px(4.))
         .text_size(px(11.))
-        .text_color(rgb(DIM))
+        .text_color(rgb(dim))
         .child(text)
 }
 
@@ -2536,18 +2699,18 @@ fn dot(color: u32, on: bool) -> gpui::Div {
         .w(px(7.))
         .h(px(7.))
         .rounded(px(4.))
-        .bg(rgb(if on { color } else { 0x000000 }))
+        .bg(if on { rgb(color) } else { rgba(0) })
 }
 
-fn kind_dot(kind: Kind, parent: bool) -> gpui::Div {
+fn kind_dot(kind: Kind, parent: bool, colors: Palette) -> gpui::Div {
     let color = if parent {
-        DIM
+        colors.dim
     } else {
         match kind {
-            Kind::Dir => HONEY,
-            Kind::Symlink => BLUE,
-            Kind::File => 0x8a8175,
-            Kind::Other => DANGER,
+            Kind::Dir => colors.accent,
+            Kind::Symlink => colors.link,
+            Kind::File => colors.file,
+            Kind::Other => colors.danger,
         }
     };
     div().w(px(8.)).h(px(8.)).rounded(px(2.)).bg(rgb(color))
