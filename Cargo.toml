@@ -1,0 +1,27 @@
+[package]
+name = "beefile"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Fast, lean file manager for Omarchy, built with GPUI"
+
+[dependencies]
+# Published GPUI. Wayland only: Omarchy runs on Hyprland.
+# `gpui_platform` from current Zed main is not on crates.io yet.
+gpui = { version = "0.2.2", default-features = false, features = ["wayland"] }
+async-channel = "2"
+libc = "0.2"
+notify = "6.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+# GPUI in full debug is too slow to scroll a file list. Optimize dependencies
+# in dev builds so `scripts/dev.sh` is usable while iterating.
+[profile.dev.package."*"]
+opt-level = 2
+
+# GPUI 0.2.2 pulls xattr 0.2.3, which still names libc::ENOATTR. libc 0.2.190
+# removed that constant. The vendored copy maps it to ENODATA on Linux.
+[patch.crates-io]
+xattr = { path = "vendor/xattr" }

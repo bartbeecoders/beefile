@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "id": "bart.beefile",
+  "name": "BeeFile",
+  "version": "0.1.0",
+  "author": "Bart Roelant",
+  "description": "Open BeeFile from the Omarchy bar. A click focuses the window, or starts one.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "BeeFile",
+    "description": "Focus BeeFile, or start it.",
+    "category": "Files",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "binary": "",
+      "startPath": ""
+    },
+    "schema": [
+      {
+        "key": "binary",
+        "type": "string",
+        "label": "BeeFile binary",
+        "defaultValue": "",
+        "description": "Empty uses ~/.local/bin/beefile, which scripts/install-omarchy.sh installs."
+      },
+      {
+        "key": "startPath",
+        "type": "path",
+        "label": "Folder to open",
+        "defaultValue": "",
+        "description": "Empty lets BeeFile open the directory it inherits. A path opens that folder."
+      }
+    ]
+  }
+}
