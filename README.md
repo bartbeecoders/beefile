@@ -50,6 +50,7 @@ The Wayland app id is `BeeFile`, so a Hyprland rule can match it by that name.
 | Ctrl-L | Go to a path |
 | `.` | Show hidden files |
 | `s` / `S` | Change sort column / reverse |
+| `t` | Cycle color theme |
 | `?` | Help inside the window |
 | `q` or Ctrl-Q | Quit |
 
@@ -59,4 +60,10 @@ BeeFile will not trash or delete `/`, your home directory, or a top-level direct
 
 ## Layout
 
-Places on the left include Home, the usual XDG folders that exist, `/`, and each mount under `/run/media/$USER`. Favorites are listed under Places once you add one. They are stored one path per line in `~/.config/beefile/favorites`, or under `$XDG_CONFIG_HOME` when that is set. Extension links live in `~/.config/beefile/openers`: one line is the extension, a tab, then a desktop id such as `imv.desktop` or a command. `%f` in a command is the file. The path bar is clickable. A dot marks a selected file. Folder names are honey, symlinks are blue.
+Places on the left include Home, the usual XDG folders that exist, `/`, and each mount under `/run/media/$USER`. Favorites are listed under Places once you add one. They are stored one path per line in `~/.config/beefile/favorites`, or under `$XDG_CONFIG_HOME` when that is set. Extension links live in `~/.config/beefile/openers`: one line is the extension, a tab, then a desktop id such as `imv.desktop` or a command. `%f` in a command is the file. The path bar is clickable. A dot marks a selected file. Folder names use the accent color. Symlinks use the link color.
+
+## Themes
+
+`t` cycles the color theme. **Honey** is BeeFile's own palette. **Omarchy** follows the theme selected on the desktop (`omarchy theme current`), and it updates when that theme changes while BeeFile is open.
+
+The choice is one word in `~/.config/beefile/theme` (`honey` or `omarchy`), or under `$XDG_CONFIG_HOME` when that is set. With no file, BeeFile uses Omarchy when the desktop palette can be read from `$XDG_STATE_HOME/omarchy/current/theme/colors.toml`, which is `~/.local/state/omarchy/current/theme/colors.toml` by default.

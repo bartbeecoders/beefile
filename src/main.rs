@@ -3,6 +3,7 @@ mod format;
 mod fsops;
 mod model;
 mod openers;
+mod theme;
 mod version;
 
 use std::path::PathBuf;
