@@ -23,5 +23,9 @@ opt-level = 2
 
 # GPUI 0.2.2 pulls xattr 0.2.3, which still names libc::ENOATTR. libc 0.2.190
 # removed that constant. The vendored copy maps it to ENODATA on Linux.
+#
+# vendor/gpui is GPUI 0.2.2 with `App::start_file_drag`, which hands files to
+# the Wayland compositor as a drag other apps can drop (text/uri-list).
 [patch.crates-io]
 xattr = { path = "vendor/xattr" }
+gpui = { path = "vendor/gpui" }

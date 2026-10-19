@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    actions, anchored, div, prelude::*, px, rgb, rgba, uniform_list, App, Context, FocusHandle,
-    KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, ScrollStrategy,
-    UniformListScrollHandle, Window,
+    actions, anchored, canvas, div, prelude::*, px, rgb, rgba, uniform_list, App, Context,
+    CursorStyle, DragMoveEvent, FocusHandle, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
+    Pixels, Point, ScrollStrategy, UniformListScrollHandle, Window,
 };
 use notify::Watcher;
 
@@ -54,6 +54,11 @@ actions!(
         MarkUp,
         MarkAll,
         Cancel,
+        NewTab,
+        OpenInTab,
+        CloseTab,
+        NextTab,
+        PrevTab,
     ]
 );
 
@@ -64,6 +69,11 @@ const HELP: &[(&str, &str)] = &[
     ("g g    G", "Top / bottom"),
     ("PgUp  PgDn", "Page"),
     ("[  ]", "Back / forward"),
+    ("Ctrl-T", "New tab"),
+    ("Ctrl-Enter  Middle-click", "Open folder in a new tab"),
+    ("Ctrl-W", "Close tab"),
+    ("Ctrl-Tab  Ctrl-PgDn", "Next tab"),
+    ("Ctrl-Shift-Tab  Ctrl-PgUp", "Previous tab"),
     ("~", "Home"),
     ("Enter on a file", "Linked app, or xdg-open"),
     ("Space", "Mark and move down"),
@@ -73,6 +83,7 @@ const HELP: &[(&str, &str)] = &[
     ("x", "Cut"),
     ("p", "Paste"),
     ("Drag", "Move onto a folder. Ctrl copies"),
+    ("Drag over a tab", "Switch to it, then drop"),
     ("Right-click a folder", "Favorite, or open foot or Cursor"),
     ("Right-click a file", "Link its extension to an app"),
     ("Y  Ctrl-C", "Copy path"),
@@ -83,7 +94,7 @@ const HELP: &[(&str, &str)] = &[
     ("Shift-N", "New folder"),
     ("/", "Filter"),
     ("Ctrl-L", "Go to path"),
-    (".", "Show hidden files"),
+    (".  Ctrl-H", "Show hidden files"),
     ("s    S", "Cycle sort / reverse"),
     ("t", "Cycle color theme"),
     ("Ctrl-R  F5", "Refresh"),
@@ -120,6 +131,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("pageup", PageUp, Some("BeeFile")),
         KeyBinding::new("ctrl-u", PageUp, Some("BeeFile")),
         KeyBinding::new(".", ToggleHidden, Some("BeeFile")),
+        KeyBinding::new("ctrl-h", ToggleHidden, Some("BeeFile")),
         KeyBinding::new("s", CycleSort, Some("BeeFile")),
         KeyBinding::new("shift-s", ToggleSortDir, Some("BeeFile")),
         KeyBinding::new("t", CycleTheme, Some("BeeFile")),
@@ -147,6 +159,13 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-k", MarkUp, Some("BeeFile")),
         KeyBinding::new("ctrl-a", MarkAll, Some("BeeFile")),
         KeyBinding::new("escape", Cancel, Some("BeeFile")),
+        KeyBinding::new("ctrl-t", NewTab, Some("BeeFile")),
+        KeyBinding::new("ctrl-enter", OpenInTab, Some("BeeFile")),
+        KeyBinding::new("ctrl-w", CloseTab, Some("BeeFile")),
+        KeyBinding::new("ctrl-tab", NextTab, Some("BeeFile")),
+        KeyBinding::new("ctrl-pagedown", NextTab, Some("BeeFile")),
+        KeyBinding::new("ctrl-shift-tab", PrevTab, Some("BeeFile")),
+        KeyBinding::new("ctrl-pageup", PrevTab, Some("BeeFile")),
     ]);
 }
 
@@ -248,6 +267,39 @@ impl PromptState {
     }
 }
 
+/// A tab parked in the background. The active tab lives in `Browser`'s own
+/// fields; switching tabs swaps them with the parked copy.
+struct Tab {
+    cwd: PathBuf,
+    listing: Listing,
+    marks: BTreeSet<PathBuf>,
+    scroll: UniformListScrollHandle,
+    back: Vec<PathBuf>,
+    forward: Vec<PathBuf>,
+    pending_select: Option<String>,
+    free: Option<u64>,
+}
+
+impl Tab {
+    /// A fresh tab on `cwd` that keeps the hidden and sort settings of `like`.
+    fn new(cwd: PathBuf, like: &Listing) -> Self {
+        let mut listing = Listing::new(&cwd);
+        listing.show_hidden = like.show_hidden;
+        listing.sort = like.sort;
+        listing.ascending = like.ascending;
+        Self {
+            cwd,
+            listing,
+            marks: BTreeSet::new(),
+            scroll: UniformListScrollHandle::new(),
+            back: Vec::new(),
+            forward: Vec::new(),
+            pending_select: None,
+            free: None,
+        }
+    }
+}
+
 pub struct Browser {
     focus: FocusHandle,
     prompt_focus: FocusHandle,
@@ -282,12 +334,19 @@ pub struct Browser {
     generation: u64,
     pending_select: Option<String>,
     last_click: Option<(usize, Instant)>,
+    /// Paths handed to the compositor when a drag left the window. If they come
+    /// back as a drop, BeeFile treats it as its own drag (move, Ctrl copies).
+    outgoing_drag: Option<Vec<PathBuf>>,
     /// Set when a prompt key was handled, so the matching list action does not also run.
     ate_key: bool,
     watch_tx: async_channel::Sender<()>,
     watcher: Option<notify::RecommendedWatcher>,
     back: Vec<PathBuf>,
     forward: Vec<PathBuf>,
+    /// Every tab in order. The entry at `active_tab` is a stale slot: the
+    /// active tab's state is in the fields above.
+    tabs: Vec<Tab>,
+    active_tab: usize,
 }
 
 impl Browser {
@@ -306,6 +365,7 @@ impl Browser {
         let prompt_focus = cx.focus_handle();
         focus.focus(window);
         let listing = Listing::new(&cwd);
+        let slot = Tab::new(cwd.clone(), &listing);
         let mut this = Self {
             focus,
             prompt_focus,
@@ -338,11 +398,14 @@ impl Browser {
             generation: 0,
             pending_select: select,
             last_click: None,
+            outgoing_drag: None,
             ate_key: false,
             watch_tx: tx,
             watcher: None,
             back: Vec::new(),
             forward: Vec::new(),
+            tabs: vec![slot],
+            active_tab: 0,
         };
         this.refresh_places();
         this.favorites = fsops::read_favorites(&this.favorites_file);
@@ -1133,8 +1196,13 @@ impl Browser {
         if self.typing() {
             return;
         }
+        self.flip_hidden(cx);
+    }
+
+    fn flip_hidden(&mut self, cx: &mut Context<Self>) {
         self.listing.show_hidden = !self.listing.show_hidden;
         self.listing.refilter();
+        self.menu = None;
         self.reveal(cx);
     }
 
@@ -1241,12 +1309,44 @@ impl Browser {
         copy: bool,
         cx: &mut Context<Self>,
     ) {
+        if !copy
+            && paths
+                .iter()
+                .all(|path| path.parent() == Some(dest.as_path()))
+        {
+            return;
+        }
         self.spawn_work(
             cx,
             if copy { "Copying…" } else { "Moving…" },
             false,
             move || fsops::drop_into(&paths, &dest, copy),
         );
+    }
+
+    /// Hand a file drag to the compositor once it reaches the window edge, so it
+    /// can be dropped into another app. Inside the window the drag stays BeeFile's.
+    fn maybe_drag_out(
+        &mut self,
+        event: &DragMoveEvent<FileDrag>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pos = event.event.position;
+        let bounds = event.bounds;
+        let edge = px(4.);
+        let near_edge = pos.x <= bounds.left() + edge
+            || pos.y <= bounds.top() + edge
+            || pos.x >= bounds.right() - edge
+            || pos.y >= bounds.bottom() - edge;
+        if !near_edge {
+            return;
+        }
+        let paths = event.drag(cx).paths.clone();
+        if cx.start_file_drag(&paths) {
+            cx.stop_active_drag(window);
+            self.outgoing_drag = Some(paths);
+        }
     }
 
     fn copy_path(&mut self, _: &CopyPath, _: &mut Window, cx: &mut Context<Self>) {
@@ -1646,6 +1746,137 @@ impl Browser {
             .collect()
     }
 
+    /// Swap the active tab's fields with the parked tab at `ix`.
+    fn swap_tab(&mut self, ix: usize) {
+        let tab = &mut self.tabs[ix];
+        std::mem::swap(&mut self.cwd, &mut tab.cwd);
+        std::mem::swap(&mut self.listing, &mut tab.listing);
+        std::mem::swap(&mut self.marks, &mut tab.marks);
+        std::mem::swap(&mut self.scroll, &mut tab.scroll);
+        std::mem::swap(&mut self.back, &mut tab.back);
+        std::mem::swap(&mut self.forward, &mut tab.forward);
+        std::mem::swap(&mut self.pending_select, &mut tab.pending_select);
+        std::mem::swap(&mut self.free, &mut tab.free);
+    }
+
+    fn tab_cwd(&self, ix: usize) -> &Path {
+        if ix == self.active_tab {
+            &self.cwd
+        } else {
+            &self.tabs[ix].cwd
+        }
+    }
+
+    fn switch_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if ix == self.active_tab || ix >= self.tabs.len() {
+            return;
+        }
+        if self.prompt.is_some() {
+            self.close_prompt(true, window);
+        }
+        self.swap_tab(self.active_tab);
+        self.active_tab = ix;
+        self.swap_tab(ix);
+        self.menu = None;
+        self.help = false;
+        self.error = None;
+        self.last_click = None;
+        self.focus.focus(window);
+        self.listing.set_cwd(&self.cwd);
+        self.arm_watcher();
+        self.set_title(window);
+        // Parked tabs are not watched. Read the folder again on the way in.
+        self.reload(cx, true);
+        cx.notify();
+    }
+
+    /// Open `path` in a new tab right after the active one.
+    fn open_tab(
+        &mut self,
+        path: PathBuf,
+        activate: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        if !path.is_dir() {
+            self.error = Some(format!("Not a directory: {}", path.display()));
+            cx.notify();
+            return;
+        }
+        let ix = self.active_tab + 1;
+        self.tabs.insert(ix, Tab::new(path, &self.listing));
+        self.menu = None;
+        if activate {
+            self.switch_tab(ix, window, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn close_tab_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tabs.len() < 2 || ix >= self.tabs.len() {
+            return;
+        }
+        if ix == self.active_tab {
+            let next = if ix + 1 < self.tabs.len() {
+                ix + 1
+            } else {
+                ix - 1
+            };
+            self.switch_tab(next, window, cx);
+        }
+        self.tabs.remove(ix);
+        if ix < self.active_tab {
+            self.active_tab -= 1;
+        }
+        self.menu = None;
+        cx.notify();
+    }
+
+    fn new_tab(&mut self, _: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.typing() {
+            return;
+        }
+        self.open_tab(self.cwd.clone(), true, window, cx);
+    }
+
+    fn open_in_tab(&mut self, _: &OpenInTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.typing() {
+            return;
+        }
+        let Some(info) = self.listing.cursor_info() else {
+            return;
+        };
+        let path = info.path.to_path_buf();
+        if info.is_parent || info.kind == Kind::Dir || path.is_dir() {
+            self.open_tab(path, true, window, cx);
+        }
+    }
+
+    fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.typing() {
+            return;
+        }
+        self.close_tab_at(self.active_tab, window, cx);
+    }
+
+    fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.typing() {
+            return;
+        }
+        let ix = (self.active_tab + 1) % self.tabs.len();
+        self.switch_tab(ix, window, cx);
+    }
+
+    fn prev_tab(&mut self, _: &PrevTab, window: &mut Window, cx: &mut Context<Self>) {
+        if self.typing() {
+            return;
+        }
+        let ix = (self.active_tab + self.tabs.len() - 1) % self.tabs.len();
+        self.switch_tab(ix, window, cx);
+    }
+
     fn sort_arrow(&self, key: SortKey) -> &'static str {
         if self.listing.sort != key {
             return "";
@@ -1670,6 +1901,14 @@ impl Render for Browser {
             .bg(rgb(self.palette.bg))
             .text_color(rgb(self.palette.text))
             .text_size(px(14.))
+            .on_drag_move(
+                cx.listener(|this, event: &DragMoveEvent<FileDrag>, window, cx| {
+                    this.maybe_drag_out(event, window, cx);
+                }),
+            )
+            .capture_any_mouse_down(cx.listener(|this, _: &MouseDownEvent, _window, _cx| {
+                this.outgoing_drag = None;
+            }))
             .on_modifiers_changed(cx.listener(
                 |_this, _: &gpui::ModifiersChangedEvent, window, cx| {
                     if cx.has_active_drag() {
@@ -1711,6 +1950,15 @@ impl Render for Browser {
             .on_action(cx.listener(Self::mark_up))
             .on_action(cx.listener(Self::mark_all))
             .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::new_tab))
+            .on_action(cx.listener(Self::open_in_tab))
+            .on_action(cx.listener(Self::close_tab))
+            .on_action(cx.listener(Self::next_tab))
+            .on_action(cx.listener(Self::prev_tab));
+        if self.tabs.len() > 1 {
+            root = root.child(self.render_tabs(cx));
+        }
+        root = root
             .child(self.render_path(crumbs, cx))
             .child(
                 div()
@@ -1731,6 +1979,127 @@ impl Render for Browser {
 }
 
 impl Browser {
+    /// Shown once there is more than one tab. Click switches, middle-click
+    /// closes. Dragging over a tab switches to it, and a drop on the tab goes
+    /// into its folder.
+    fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let c = self.palette;
+        let mut bar = div()
+            .id("tabs")
+            .flex()
+            .items_end()
+            .gap(px(2.))
+            .px(px(8.))
+            .pt(px(6.))
+            .bg(rgb(c.bg))
+            .border_b_1()
+            .border_color(rgb(c.line))
+            .overflow_x_scroll();
+        for ix in 0..self.tabs.len() {
+            let path = self.tab_cwd(ix).to_path_buf();
+            let active = ix == self.active_tab;
+            let label = folder_label(&path, &self.home);
+            let close = div()
+                .id(("tab-close", ix))
+                .w(px(16.))
+                .flex()
+                .justify_center()
+                .rounded(px(3.))
+                .text_color(rgb(c.dim))
+                .hover(|style| style.bg(rgb(c.select)).text_color(rgb(c.text)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.close_tab_at(ix, window, cx);
+                    }),
+                )
+                .child("×");
+            bar = bar.child(
+                attach_drop(
+                    div()
+                        .id(("tab", ix))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .max_w(px(220.))
+                        .pl(px(12.))
+                        .pr(px(6.))
+                        .py(px(5.))
+                        .rounded_t(px(5.))
+                        .cursor_pointer()
+                        .bg(rgb(if active { c.panel } else { c.bg }))
+                        .text_color(rgb(if active { c.accent } else { c.muted }))
+                        .hover(move |style| {
+                            if active {
+                                style
+                            } else {
+                                style.bg(rgb(c.elevated))
+                            }
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                this.switch_tab(ix, window, cx);
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Middle,
+                            cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                this.close_tab_at(ix, window, cx);
+                            }),
+                        )
+                        // Holding a drag over a tab brings that tab forward, so
+                        // the drop can land on one of its folders.
+                        .on_drag_move(cx.listener(
+                            move |this, event: &DragMoveEvent<FileDrag>, window, cx| {
+                                if event.bounds.contains(&event.event.position) {
+                                    this.switch_tab(ix, window, cx);
+                                }
+                            },
+                        ))
+                        .on_drag_move(cx.listener(
+                            move |this, event: &DragMoveEvent<gpui::ExternalPaths>, window, cx| {
+                                if event.bounds.contains(&event.event.position) {
+                                    this.switch_tab(ix, window, cx);
+                                }
+                            },
+                        )),
+                    path,
+                    true,
+                    c.drop,
+                    cx,
+                )
+                .child(
+                    div()
+                        .min_w(px(0.))
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .child(label),
+                )
+                .child(close),
+            );
+        }
+        bar.child(
+            div()
+                .id("tab-new")
+                .px(px(8.))
+                .py(px(5.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .text_color(rgb(c.dim))
+                .hover(|style| style.bg(rgb(c.elevated)).text_color(rgb(c.text)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        this.open_tab(this.cwd.clone(), true, window, cx);
+                    }),
+                )
+                .child("+"),
+        )
+    }
+
     fn render_path(&self, crumbs: Vec<Crumb>, cx: &mut Context<Self>) -> impl IntoElement {
         let c = self.palette;
         let mut row = div()
@@ -1751,6 +2120,7 @@ impl Browser {
             let path = crumb.path.clone();
             let current = path == self.cwd;
             let click_path = path.clone();
+            let tab_path = path.clone();
             let menu_path = path.clone();
             row = row.child(
                 attach_drop(
@@ -1766,6 +2136,12 @@ impl Browser {
                             MouseButton::Left,
                             cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
                                 this.navigate(click_path.clone(), true, None, window, cx);
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Middle,
+                            cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
+                                this.open_tab(tab_path.clone(), false, window, cx);
                             }),
                         )
                         .on_mouse_down(
@@ -1839,6 +2215,7 @@ impl Browser {
         let c = self.palette;
         let active = path == self.cwd;
         let click_path = path.clone();
+        let tab_path = path.clone();
         let menu_path = path.clone();
         attach_drop(
             div()
@@ -1858,6 +2235,12 @@ impl Browser {
                     MouseButton::Left,
                     cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
                         this.navigate(click_path.clone(), true, None, window, cx);
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Middle,
+                    cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
+                        this.open_tab(tab_path.clone(), false, window, cx);
                     }),
                 )
                 .on_mouse_down(
@@ -2019,6 +2402,7 @@ impl Browser {
                                 || kind == Kind::Dir
                                 || (kind == Kind::Symlink && path.is_dir());
                             let menu_path = path.clone();
+                            let tab_path = path.clone();
                             let mut row = div()
                                 .id(("row", ix))
                                 .w_full()
@@ -2040,6 +2424,14 @@ impl Browser {
                                     MouseButton::Left,
                                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                                         this.on_row_click(ix, event, window, cx);
+                                    }),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Middle,
+                                    cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                        if drop_here {
+                                            this.open_tab(tab_path.clone(), false, window, cx);
+                                        }
                                     }),
                                 )
                                 .on_mouse_down(
@@ -2072,7 +2464,7 @@ impl Browser {
                             row = if drop_here {
                                 attach_drop(row, path.clone(), true, c.drop, cx)
                             } else {
-                                swallow_drop(row, cx)
+                                attach_drop(row, this.cwd.clone(), false, c.drop, cx)
                             };
                             items.push(
                                 row.child(
@@ -2395,9 +2787,17 @@ impl Browser {
         if is_file {
             panel = self.file_menu(panel, &menu, cx);
         } else if is_dir {
+            let tab_path = path.clone();
             let foot_path = path.clone();
             let cursor_path = path.clone();
             panel = panel
+                .child(menu_action(
+                    "context-menu-tab",
+                    "Open in new tab  ·  Ctrl-Enter".to_string(),
+                    c.select,
+                    cx,
+                    move |this, window, cx| this.open_tab(tab_path.clone(), true, window, cx),
+                ))
                 .child(menu_action(
                     "context-menu-foot",
                     "Open foot here".to_string(),
@@ -2428,6 +2828,18 @@ impl Browser {
                 move |this, _window, cx| this.toggle_favorite(&fav_path, cx),
             ));
         }
+        let hidden_label = if self.listing.show_hidden {
+            "Hide hidden files"
+        } else {
+            "Show hidden files"
+        };
+        panel = panel.child(menu_rule(c.line)).child(menu_action(
+            "context-menu-hidden",
+            format!("{hidden_label}  ·  Ctrl-H"),
+            c.select,
+            cx,
+            move |this, _window, cx| this.flip_hidden(cx),
+        ));
         anchored()
             .position(menu.position)
             .snap_to_window_with_margin(px(8.))
@@ -2616,16 +3028,42 @@ impl Render for DragGhost {
         let copy = window.modifiers().control;
         let verb = if copy { "Copy" } else { "Move" };
         let colors = self.colors;
-        div()
+        let border = if copy { colors.link } else { colors.accent };
+        let mut ghost = div()
+            .flex()
+            .items_center()
+            .gap(px(8.))
             .px(px(10.))
             .py(px(6.))
             .bg(rgb(colors.elevated))
             .border_1()
-            .border_color(rgb(if copy { colors.link } else { colors.accent }))
+            .border_color(rgb(border))
             .rounded(px(4.))
             .text_size(px(13.))
-            .text_color(rgb(colors.text))
-            .child(format!("{verb} {}", self.label))
+            .text_color(rgb(colors.text));
+        if copy {
+            ghost = ghost
+                .child(
+                    div()
+                        .size(px(16.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .bg(rgb(border))
+                        .text_color(rgb(colors.bg))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .child("+"),
+                )
+                .child(
+                    canvas(
+                        |_, _, _| {},
+                        |_, _, window, _| window.set_window_cursor_style(CursorStyle::DragCopy),
+                    )
+                    .size_0(),
+                );
+        }
+        ghost.child(format!("{verb} {}", self.label))
     }
 }
 
@@ -2657,8 +3095,11 @@ where
             this.accept_drop(drag.paths.clone(), dest.clone(), copy, cx);
         }))
         .on_drop(
-            cx.listener(move |this, drag: &gpui::ExternalPaths, _window, cx| {
-                this.accept_drop(drag.paths().to_vec(), external_dest.clone(), true, cx);
+            cx.listener(move |this, drag: &gpui::ExternalPaths, window, cx| {
+                let paths = drag.paths().to_vec();
+                let ours = this.outgoing_drag.take().is_some_and(|out| out == paths);
+                let copy = !ours || window.modifiers().control;
+                this.accept_drop(paths, external_dest.clone(), copy, cx);
             }),
         );
     if highlight {
@@ -2667,21 +3108,6 @@ where
             .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| style.bg(rgb(external_color)));
     }
     element
-}
-
-fn swallow_drop<E>(element: E, cx: &mut Context<Browser>) -> E
-where
-    E: InteractiveElement,
-{
-    element
-        .on_drop(
-            cx.listener(
-                |_: &mut Browser, _: &FileDrag, _: &mut Window, _: &mut Context<Browser>| {},
-            ),
-        )
-        .on_drop(cx.listener(
-            |_: &mut Browser, _: &gpui::ExternalPaths, _: &mut Window, _: &mut Context<Browser>| {},
-        ))
 }
 
 fn section_label(text: &'static str, dim: u32) -> gpui::Div {
