@@ -37,9 +37,13 @@ The Wayland app id is `BeeFile`, so a Hyprland rule can match it by that name.
 | `g g` / `G` | Top / bottom |
 | `[` `]` | Back / forward |
 | `~` | Home |
+| Ctrl-T | New tab on the current folder |
+| Ctrl-Enter or middle-click a folder | Open the folder in a new tab (middle-click opens it in the background) |
+| Ctrl-W or middle-click a tab | Close the tab |
+| Ctrl-Tab / Ctrl-Shift-Tab | Next / previous tab. Ctrl-PgDn and Ctrl-PgUp also work |
 | Space | Mark, then move down |
 | `y` `x` `p` | Copy, cut, paste |
-| Drag | Move onto a folder, a place, or the path bar. Hold Ctrl to copy. A drop from another app copies |
+| Drag | Move onto a folder, a place, or the path bar. Hold Ctrl to copy (shows +). Ctrl-drop onto a name that is already taken, in the same folder or another tab's folder, makes `name (copy)`, then `name (copy 2)`. Drag past the window edge to drop into another app, such as Cursor or a terminal. A drop from another app copies |
 | Right-click a folder | Add or remove a favorite, or open foot or Cursor there |
 | Right-click a file | Link its extension to an app that can open it. Enter uses that link |
 | `d` or Delete | Trash |
@@ -48,7 +52,7 @@ The Wayland app id is `BeeFile`, so a Hyprland rule can match it by that name.
 | `n` / Shift-N | New file / new folder |
 | `/` | Filter |
 | Ctrl-L | Go to a path |
-| `.` | Show hidden files |
+| `.` or Ctrl-H | Show or hide hidden files |
 | `s` / `S` | Change sort column / reverse |
 | `t` | Cycle color theme |
 | `?` | Help inside the window |
@@ -56,11 +60,13 @@ The Wayland app id is `BeeFile`, so a Hyprland rule can match it by that name.
 
 BeeFile will not trash or delete `/`, your home directory, or a top-level directory such as `/usr`. Paste does not overwrite an existing name. Trash follows the FreeDesktop trash spec: the home trash when the file is on that filesystem, otherwise the volume's `.Trash-$uid` directory.
 
+`vendor/gpui` is GPUI 0.2.2 plus `App::start_file_drag`. Published GPUI cannot start a Wayland drag, so files could not be dragged out to other apps. The patch adds a `wl_data_device` drag source that offers `text/uri-list` and plain paths. BeeFile hands its drag to it when the pointer reaches the window edge. The upstream examples are removed.
+
 `vendor/xattr` is xattr 0.2.3 with one Linux fix. GPUI 0.2.2 still depends on that release, and it does not compile against current libc (`ENOATTR` was removed; the missing-attribute errno on Linux is `ENODATA`).
 
 ## Layout
 
-Places on the left include Home, the usual XDG folders that exist, `/`, and each mount under `/run/media/$USER`. Favorites are listed under Places once you add one. They are stored one path per line in `~/.config/beefile/favorites`, or under `$XDG_CONFIG_HOME` when that is set. Extension links live in `~/.config/beefile/openers`: one line is the extension, a tab, then a desktop id such as `imv.desktop` or a command. `%f` in a command is the file. The path bar is clickable. A dot marks a selected file. Folder names use the accent color. Symlinks use the link color.
+Places on the left include Home, the usual XDG folders that exist, `/`, and each mount under `/run/media/$USER`. Favorites are listed under Places once you add one. They are stored one path per line in `~/.config/beefile/favorites`, or under `$XDG_CONFIG_HOME` when that is set. Extension links live in `~/.config/beefile/openers`: one line is the extension, a tab, then a desktop id such as `imv.desktop` or a command. `%f` in a command is the file. The tab bar appears above the path bar once a second tab is open. Each tab keeps its own folder, history, cursor, marks, filter, and sort. Drag files over a tab to switch to it, then drop them on a folder there, or drop them on the tab itself to move them into its folder. Hold Ctrl to copy. The path bar is clickable. A dot marks a selected file. Folder names use the accent color. Symlinks use the link color.
 
 ## Themes
 

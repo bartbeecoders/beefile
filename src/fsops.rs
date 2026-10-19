@@ -226,6 +226,8 @@ pub fn rename(from: &Path, to: &Path) -> Result<(), String> {
 
 /// Move `sources` into `dest`, or copy them when `copy` is set.
 /// A move onto the folder that already contains the file is skipped.
+/// A copy onto a name that is taken, in that folder or any other, makes a
+/// duplicate named like `note (copy).txt`.
 pub fn drop_into(sources: &[PathBuf], dest: &Path, copy: bool) -> Result<String, String> {
     ensure_mutable(dest)?;
     if !dest.is_dir() {
@@ -242,7 +244,9 @@ pub fn drop_into(sources: &[PathBuf], dest: &Path, copy: bool) -> Result<String,
         if !copy && src.parent() == Some(dest) {
             continue;
         }
-        if copy {
+        if copy && exists(&dest.join(file_name(src)?)) {
+            copy_path(src, &copy_name(src, dest)?)?;
+        } else if copy {
             copy_into(src, dest)?;
         } else {
             move_into(src, dest)?;
@@ -256,6 +260,29 @@ pub fn drop_into(sources: &[PathBuf], dest: &Path, copy: bool) -> Result<String,
     } else {
         Ok(format!("Moved {done}"))
     }
+}
+
+/// The first free name for a duplicate of `src` in `dir`:
+/// `note (copy).txt`, then `note (copy 2).txt`. Folders keep no extension.
+fn copy_name(src: &Path, dir: &Path) -> Result<PathBuf, String> {
+    let name = file_name(src)?.to_string_lossy().into_owned();
+    let is_dir = fs::symlink_metadata(src).is_ok_and(|meta| meta.is_dir());
+    let (stem, ext) = match name.rfind('.') {
+        Some(dot) if dot > 0 && !is_dir => name.split_at(dot),
+        _ => (name.as_str(), ""),
+    };
+    for n in 1..10_000 {
+        let tag = if n == 1 {
+            "copy".to_string()
+        } else {
+            format!("copy {n}")
+        };
+        let candidate = dir.join(format!("{stem} ({tag}){ext}"));
+        if !exists(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(format!("No free name for a copy of {}", src.display()))
 }
 
 pub fn copy_into(src: &Path, dest_dir: &Path) -> Result<(), String> {
@@ -848,6 +875,23 @@ mod tests {
         );
         assert!(exists(&moved));
         assert_eq!(fs::read(src_dir.join("note.txt")).unwrap(), b"hello");
+
+        let original = src_dir.join("note.txt");
+        drop_into(&[original.clone()], &src_dir, true).unwrap();
+        drop_into(&[original.clone()], &src_dir, true).unwrap();
+        assert_eq!(fs::read(src_dir.join("note (copy).txt")).unwrap(), b"hello");
+        assert!(exists(&src_dir.join("note (copy 2).txt")));
+        drop_into(&[dest_dir.clone()], dir.path(), true).unwrap();
+        assert!(dir.path().join("dest (copy)").join("note.txt").is_file());
+
+        // A copy into another folder that already has the name gets a copy name too.
+        fs::write(&moved, b"other").unwrap();
+        drop_into(&[original.clone()], &dest_dir, true).unwrap();
+        assert_eq!(fs::read(&moved).unwrap(), b"other");
+        assert_eq!(
+            fs::read(dest_dir.join("note (copy).txt")).unwrap(),
+            b"hello"
+        );
 
         let folder = dir.path().join("folder");
         create_dir(&folder).unwrap();
