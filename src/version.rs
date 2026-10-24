@@ -1,6 +1,6 @@
 //! Version compiled into this binary.
 
-/// `0.1.0+42`. The number after `+` increases when a changed tree is compiled.
+/// `0.2.0+42`. The number after `+` increases when a changed tree is compiled.
 pub fn label() -> &'static str {
     env!("BEEFILE_VERSION")
 }

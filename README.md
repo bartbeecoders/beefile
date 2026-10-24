@@ -25,7 +25,7 @@ beefile --help
 
 The Wayland app id is `BeeFile`, so a Hyprland rule can match it by that name.
 
-`beefile --version` prints the version, such as `0.1.0+42`. That same string is at the right of the status bar and in the window title. The number after `+` goes up when you compile a change. It is stored in `target/beefile-build-number`.
+`beefile --version` prints the version, such as `0.2.0+42`. That same string is at the right of the status bar and in the window title. The number after `+` goes up when you compile a change. It is stored in `target/beefile-build-number`.
 
 ## Keys
 

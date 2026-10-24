@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    actions, anchored, canvas, div, prelude::*, px, rgb, rgba, uniform_list, App, Context,
-    CursorStyle, DragMoveEvent, FocusHandle, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
-    Pixels, Point, ScrollStrategy, UniformListScrollHandle, Window,
+    actions, anchored, canvas, div, fill, point, prelude::*, px, rgb, rgba, uniform_list, App,
+    Bounds, Context, CursorStyle, DispatchPhase, DragMoveEvent, Entity, FocusHandle,
+    HitboxBehavior, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, ScrollHandle, ScrollStrategy, UniformListScrollHandle, Window,
 };
 use notify::Watcher;
 
@@ -300,10 +301,20 @@ impl Tab {
     }
 }
 
+/// Grab point for a drag of the sidebar scrollbar.
+#[derive(Clone, Copy)]
+struct SidebarScrollDrag {
+    grab_y: Pixels,
+    /// `ScrollHandle` offset at the grab. Further down is more negative.
+    start_offset: Pixels,
+}
+
 pub struct Browser {
     focus: FocusHandle,
     prompt_focus: FocusHandle,
     scroll: UniformListScrollHandle,
+    sidebar_scroll: ScrollHandle,
+    sidebar_scroll_drag: Option<SidebarScrollDrag>,
     cwd: PathBuf,
     home: PathBuf,
     listing: Listing,
@@ -370,6 +381,8 @@ impl Browser {
             focus,
             prompt_focus,
             scroll: UniformListScrollHandle::new(),
+            sidebar_scroll: ScrollHandle::new(),
+            sidebar_scroll_drag: None,
             home: fsops::home_dir(),
             cwd,
             listing,
@@ -2164,20 +2177,19 @@ impl Browser {
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let c = self.palette;
-        let mut side = div()
+        // Block, not a column: a column shrinks these rows when the window is
+        // short, and the labels pile up over the prompt. A scrollport keeps
+        // each row its own height and moves the rest under the scrollbar.
+        let mut list = div()
             .id("sidebar")
-            .w(px(196.))
-            .h_full()
-            .flex()
-            .flex_col()
+            .flex_1()
+            .min_h(px(0.))
             .py(px(8.))
-            .bg(rgb(c.panel))
-            .border_r_1()
-            .border_color(rgb(c.line))
             .overflow_y_scroll()
+            .track_scroll(&self.sidebar_scroll)
             .child(section_label("Places", c.dim));
         for (index, place) in self.places.iter().enumerate() {
-            side = side.child(self.place_row(
+            list = list.child(self.place_row(
                 ("place", index),
                 place.label.clone(),
                 place.path.clone(),
@@ -2186,15 +2198,15 @@ impl Browser {
         }
         let favorites = self.favorite_entries();
         if !favorites.is_empty() {
-            side = side.child(section_label("Favorites", c.dim));
+            list = list.child(section_label("Favorites", c.dim));
             for (index, (label, path)) in favorites.into_iter().enumerate() {
-                side = side.child(self.place_row(("fav", index), label, path, cx));
+                list = list.child(self.place_row(("fav", index), label, path, cx));
             }
         }
         if !self.media.is_empty() {
-            side = side.child(section_label("Media", c.dim));
+            list = list.child(section_label("Media", c.dim));
             for (index, place) in self.media.iter().enumerate() {
-                side = side.child(self.place_row(
+                list = list.child(self.place_row(
                     ("media", index),
                     place.label.clone(),
                     place.path.clone(),
@@ -2202,7 +2214,60 @@ impl Browser {
                 ));
             }
         }
-        side
+        div()
+            .relative()
+            .w(px(196.))
+            .h_full()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .bg(rgb(c.panel))
+            .border_r_1()
+            .border_color(rgb(c.line))
+            .child(list)
+            .child(self.sidebar_scrollbar(cx))
+    }
+
+    fn sidebar_scrollbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let scroll = self.sidebar_scroll.clone();
+        let entity = cx.entity();
+        let dragging = self.sidebar_scroll_drag.is_some();
+        let thumb_color = self.palette.muted;
+        let hot_color = self.palette.text;
+        canvas(
+            {
+                let scroll = scroll.clone();
+                move |bounds, window, _cx| {
+                    sidebar_bar(&scroll, bounds).map(|_| {
+                        window.insert_hitbox(bounds, HitboxBehavior::BlockMouseExceptScroll)
+                    })
+                }
+            },
+            move |bounds, hitbox, window, _cx| {
+                let Some(bar) = sidebar_bar(&scroll, bounds) else {
+                    return;
+                };
+                let hovered = hitbox
+                    .as_ref()
+                    .is_some_and(|hitbox| hitbox.is_hovered(window));
+                if let Some(hitbox) = hitbox.as_ref() {
+                    window.set_cursor_style(CursorStyle::ResizeUpDown, hitbox);
+                }
+                let color = if dragging || hovered {
+                    hot_color
+                } else {
+                    thumb_color
+                };
+                window.paint_quad(fill(bar.thumb_bounds, rgb(color)).corner_radii(px(2.)));
+                paint_sidebar_scroll(bounds, scroll.clone(), entity.clone(), window);
+            },
+        )
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .right_0()
+        .w(px(8.))
     }
 
     fn place_row(
@@ -3188,6 +3253,133 @@ fn next_boundary(text: &str, cursor: usize) -> usize {
         .unwrap_or(text.len())
 }
 
+const SCROLLBAR_PAD: f32 = 4.;
+
+struct SidebarThumb {
+    /// Distance from the top of the padded track.
+    y: Pixels,
+    height: Pixels,
+    /// How far the thumb can move inside the track.
+    travel: Pixels,
+}
+
+struct SidebarBar {
+    thumb: SidebarThumb,
+    thumb_bounds: Bounds<Pixels>,
+}
+
+/// Thumb geometry for a vertical scrollbar. `scrolled` is how far the content
+/// has moved down, and `max_scroll` is the furthest it can go.
+fn sidebar_thumb(viewport: Pixels, max_scroll: Pixels, scrolled: Pixels) -> Option<SidebarThumb> {
+    if max_scroll <= px(1.) || viewport <= px(16.) {
+        return None;
+    }
+    let height = (viewport * (viewport / (viewport + max_scroll)))
+        .max(px(24.))
+        .min(viewport);
+    let travel = (viewport - height).max(px(1.));
+    let progress = (scrolled / max_scroll).clamp(0., 1.);
+    Some(SidebarThumb {
+        y: travel * progress,
+        height,
+        travel,
+    })
+}
+
+fn sidebar_bar(scroll: &ScrollHandle, track: Bounds<Pixels>) -> Option<SidebarBar> {
+    let inset = px(SCROLLBAR_PAD);
+    let port = scroll.bounds();
+    let viewport = (port.size.height - inset * 2.).max(px(0.));
+    let max_scroll = scroll.max_offset().height;
+    let scrolled = (-scroll.offset().y).max(px(0.));
+    let thumb = sidebar_thumb(viewport, max_scroll, scrolled)?;
+    let width = px(5.);
+    let x = track.right() - width - px(1.);
+    let y = port.top() + inset + thumb.y;
+    let thumb_bounds = Bounds::from_corners(point(x, y), point(x + width, y + thumb.height));
+    Some(SidebarBar {
+        thumb,
+        thumb_bounds,
+    })
+}
+
+fn paint_sidebar_scroll(
+    track: Bounds<Pixels>,
+    scroll: ScrollHandle,
+    entity: Entity<Browser>,
+    window: &mut Window,
+) {
+    window.on_mouse_event({
+        let scroll = scroll.clone();
+        let entity = entity.clone();
+        move |event: &MouseDownEvent, phase, _, cx| {
+            if phase != DispatchPhase::Bubble || event.button != MouseButton::Left {
+                return;
+            }
+            let Some(bar) = sidebar_bar(&scroll, track) else {
+                return;
+            };
+            if !track.contains(&event.position) {
+                return;
+            }
+            cx.stop_propagation();
+            let offset = if bar.thumb_bounds.contains(&event.position) {
+                scroll.offset().y
+            } else {
+                let inset = px(SCROLLBAR_PAD);
+                let local =
+                    event.position.y - (scroll.bounds().top() + inset) - bar.thumb.height * 0.5;
+                let progress = (local / bar.thumb.travel).clamp(0., 1.);
+                -(scroll.max_offset().height * progress)
+            };
+            scroll.set_offset(point(px(0.), offset));
+            entity.update(cx, |this, cx| {
+                this.sidebar_scroll_drag = Some(SidebarScrollDrag {
+                    grab_y: event.position.y,
+                    start_offset: offset,
+                });
+                cx.notify();
+            });
+        }
+    });
+    window.on_mouse_event({
+        let scroll = scroll.clone();
+        let entity = entity.clone();
+        move |event: &MouseMoveEvent, phase, _, cx| {
+            if phase != DispatchPhase::Bubble || !event.dragging() {
+                return;
+            }
+            let Some(drag) = entity.read(cx).sidebar_scroll_drag else {
+                return;
+            };
+            let Some(bar) = sidebar_bar(&scroll, track) else {
+                return;
+            };
+            let max = scroll.max_offset().height;
+            let delta = event.position.y - drag.grab_y;
+            let next = (drag.start_offset - delta * (max / bar.thumb.travel)).clamp(-max, px(0.));
+            if scroll.offset().y == next {
+                return;
+            }
+            scroll.set_offset(point(px(0.), next));
+            cx.notify(entity.entity_id());
+        }
+    });
+    window.on_mouse_event({
+        let entity = entity.clone();
+        move |event: &MouseUpEvent, phase, _, cx| {
+            if phase != DispatchPhase::Bubble || event.button != MouseButton::Left {
+                return;
+            }
+            entity.update(cx, |this, cx| {
+                if this.sidebar_scroll_drag.take().is_some() {
+                    cx.notify();
+                }
+            });
+        }
+    });
+}
+
 fn simple_word_left(text: &str, cursor: usize) -> usize {
     let cursor = cursor.min(text.len());
     let head = text[..cursor].trim_end();
@@ -3201,5 +3393,26 @@ fn simple_word_left(text: &str, cursor: usize) -> usize {
             index + width
         }
         None => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::px;
+
+    use super::sidebar_thumb;
+
+    #[test]
+    fn no_thumb_when_the_list_fits() {
+        assert!(sidebar_thumb(px(200.), px(0.), px(0.)).is_none());
+    }
+
+    #[test]
+    fn thumb_rests_at_the_ends_of_the_track() {
+        let top = sidebar_thumb(px(100.), px(100.), px(0.)).unwrap();
+        let bottom = sidebar_thumb(px(100.), px(100.), px(100.)).unwrap();
+        assert!(top.y < px(0.5));
+        assert!(bottom.y > top.y);
+        assert!((bottom.y + bottom.height - px(100.)).abs() < px(0.5));
     }
 }
